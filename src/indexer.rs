@@ -647,6 +647,7 @@ fn run_index_inner(
     info!("building vault graph edges");
     if rebuild {
         store.clear_edges()?;
+        store.clear_all_unresolved_links()?;
     }
 
     // Edge building is cheap (text parsing, no embeddings), but doing it only
@@ -656,10 +657,15 @@ fn run_index_inner(
     // newly created link target is never matched against existing notes.
     // So whenever anything changed, rebuild the whole graph from the files on disk.
     let graph_dirty = !rebuild
-        && (!new_files.is_empty() || !changed_files.is_empty() || !deleted_files.is_empty());
+        && (orphans > 0
+            || !new_files.is_empty()
+            || !changed_files.is_empty()
+            || !deleted_files.is_empty());
     let mut graph_contents: HashMap<String, String> = HashMap::new();
     let graph_paths: Vec<String> = if graph_dirty {
         store.clear_edges()?;
+        // Rows of deleted sources are not removed by the per-file clears below.
+        store.clear_all_unresolved_links()?;
         for record in store.get_all_files()? {
             if let Ok(content) = std::fs::read_to_string(vault_path.join(&record.path)) {
                 graph_contents.insert(record.path, content);
@@ -1137,6 +1143,16 @@ mod tests {
             0,
             "Stale unresolved entry should be cleared after re-index"
         );
+    }
+
+    #[test]
+    fn test_clear_all_unresolved_links_drops_deleted_sources() {
+        // Rows of a source whose file record is gone must not survive a graph rebuild.
+        let store = Store::open_memory().unwrap();
+        store.insert_unresolved_link("gone.md", "missing").unwrap();
+        store.insert_unresolved_link("kept.md", "missing").unwrap();
+        store.clear_all_unresolved_links().unwrap();
+        assert!(store.get_unresolved_links().unwrap().is_empty());
     }
 
     #[test]
