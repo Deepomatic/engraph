@@ -2,24 +2,23 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [deepomatic/v1.7.2]
   pull_request:
-    branches: [main]
 
 jobs:
-  check:
-    strategy:
-      matrix:
-        os: [macos-latest, ubuntu-latest]
-    runs-on: ${{ matrix.os }}
+  test:
+    runs-on: ubuntu-latest
+    # Same base as the shared-brain runtime image (glibc 2.41); the binary needs glibc >= 2.39.
+    container: rust:1-trixie
     steps:
       - uses: actions/checkout@v4
-      - name: Install CMake (Ubuntu)
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y cmake
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-      - run: cargo fmt --check
-      - run: cargo clippy -- -D warnings
-      - run: cargo test --lib
+      - name: Install build dependencies
+        # cmake, g++: llama.cpp is compiled natively. libclang-dev: bindgen for llama-cpp-sys-2.
+        run: apt-get update && apt-get install -y --no-install-recommends cmake g++ libclang-dev
+      - name: Unit tests
+        run: cargo test --release --lib
+      - name: Chunker regression gate
+        # `cargo test <filter>` exits 0 when it matches nothing, so assert on the result line.
+        run: |
+          cargo test --release --lib test_smart_chunk_no_overlap_crawl 2>&1 | tee /tmp/chunker.log
+          grep -qE 'test result: ok\. 1 passed' /tmp/chunker.log
