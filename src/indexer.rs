@@ -649,7 +649,33 @@ fn run_index_inner(
         store.clear_edges()?;
     }
 
-    for rel_path in &indexed_rel_paths {
+    // Edge building is cheap (text parsing, no embeddings), but doing it only
+    // for re-indexed files is wrong on an incremental run: removing a changed
+    // file also deletes the edges pointing TO it, and nothing re-creates them
+    // because the linking notes are unchanged; likewise a new people note or a
+    // newly created link target is never matched against existing notes.
+    // So whenever anything changed, rebuild the whole graph from the files on disk.
+    let graph_dirty = !rebuild
+        && (!new_files.is_empty() || !changed_files.is_empty() || !deleted_files.is_empty());
+    let mut graph_contents: HashMap<String, String> = HashMap::new();
+    let graph_paths: Vec<String> = if graph_dirty {
+        store.clear_edges()?;
+        for record in store.get_all_files()? {
+            if let Ok(content) = std::fs::read_to_string(vault_path.join(&record.path)) {
+                graph_contents.insert(record.path, content);
+            }
+        }
+        graph_contents.keys().cloned().collect()
+    } else {
+        indexed_rel_paths.clone()
+    };
+    let content_by_path = if graph_dirty {
+        &graph_contents
+    } else {
+        &content_by_path
+    };
+
+    for rel_path in &graph_paths {
         if let Some(file_record) = store.get_file(rel_path)?
             && let Some(content) = content_by_path.get(rel_path)
         {
@@ -664,7 +690,7 @@ fn run_index_inner(
         let people = load_people_entities(store, people_folder, &content_by_path)?;
         if !people.is_empty() {
             info!(people_count = people.len(), "detecting people mentions");
-            for rel_path in &indexed_rel_paths {
+            for rel_path in &graph_paths {
                 if let Some(file_record) = store.get_file(rel_path)?
                     && let Some(content) = content_by_path.get(rel_path)
                 {
