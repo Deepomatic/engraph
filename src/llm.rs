@@ -799,6 +799,158 @@ impl EmbedModel for LlamaEmbed {
     }
 }
 
+// ── VertexEmbed — remote embeddings via the Vertex AI predict API ────────────
+
+/// Remote embedding backend selected with `ENGRAPH_EMBED_PROVIDER=vertex`.
+///
+/// Env: `ENGRAPH_VERTEX_ENDPOINT` (full `:predict` URL), `ENGRAPH_VERTEX_DIM`
+/// (default 768), optional `ENGRAPH_VERTEX_TOKEN` (otherwise the GCE/Cloud Run
+/// metadata server is used).
+pub struct VertexEmbed {
+    endpoint: String,
+    dim: usize,
+    agent: ureq::Agent,
+    token: Option<(String, std::time::Instant)>,
+}
+
+impl VertexEmbed {
+    pub fn from_env() -> Result<Self> {
+        let endpoint = std::env::var("ENGRAPH_VERTEX_ENDPOINT")
+            .context("ENGRAPH_VERTEX_ENDPOINT is required for the vertex embed provider")?;
+        let dim = std::env::var("ENGRAPH_VERTEX_DIM")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(768);
+        let agent = ureq::AgentBuilder::new()
+            .timeout(std::time::Duration::from_secs(30))
+            .build();
+        Ok(Self {
+            endpoint,
+            dim,
+            agent,
+            token: None,
+        })
+    }
+
+    fn access_token(&mut self) -> Result<String> {
+        if let Ok(t) = std::env::var("ENGRAPH_VERTEX_TOKEN") {
+            return Ok(t);
+        }
+        if let Some((t, at)) = &self.token
+            && at.elapsed() < std::time::Duration::from_secs(1800)
+        {
+            return Ok(t.clone());
+        }
+        let resp: serde_json::Value = serde_json::from_str(
+            &self
+            .agent
+            .get("http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token")
+            .set("Metadata-Flavor", "Google")
+            .call()
+            .context("fetching access token from the metadata server")?
+            .into_string()?,
+        )?;
+        let t = resp["access_token"]
+            .as_str()
+            .context("metadata token response has no access_token")?
+            .to_string();
+        self.token = Some((t.clone(), std::time::Instant::now()));
+        Ok(t)
+    }
+
+    fn predict(&mut self, texts: &[&str], task_type: &str) -> Result<Vec<Vec<f32>>> {
+        let token = self.access_token()?;
+        let instances: Vec<serde_json::Value> = texts
+            .iter()
+            .map(|t| serde_json::json!({ "content": t, "task_type": task_type }))
+            .collect();
+        let body = serde_json::json!({
+            "instances": instances,
+            "parameters": { "outputDimensionality": self.dim, "autoTruncate": true },
+        });
+        let mut last_err = None;
+        for attempt in 0..4u64 {
+            match self
+                .agent
+                .post(&self.endpoint)
+                .set("Authorization", &format!("Bearer {token}"))
+                .set("Content-Type", "application/json")
+                .send_string(&body.to_string())
+            {
+                Ok(resp) => {
+                    let v: serde_json::Value = serde_json::from_str(&resp.into_string()?)?;
+                    let preds = v["predictions"]
+                        .as_array()
+                        .context("vertex response has no predictions")?;
+                    return preds
+                        .iter()
+                        .map(|p| {
+                            let vals = p["embeddings"]["values"]
+                                .as_array()
+                                .context("vertex prediction has no embeddings.values")?;
+                            let mut out: Vec<f32> = vals
+                                .iter()
+                                .map(|x| x.as_f64().unwrap_or(0.0) as f32)
+                                .collect();
+                            let norm: f32 = out.iter().map(|x| x * x).sum::<f32>().sqrt();
+                            if norm > 0.0 {
+                                out.iter_mut().for_each(|x| *x /= norm);
+                            }
+                            Ok(out)
+                        })
+                        .collect();
+                }
+                Err(ureq::Error::Status(code, _)) if code == 429 || code >= 500 => {
+                    last_err = Some(anyhow::anyhow!("vertex returned HTTP {code}"));
+                    std::thread::sleep(std::time::Duration::from_millis(500 * (attempt + 1)));
+                }
+                Err(e) => bail!("vertex embedding request failed: {e}"),
+            }
+        }
+        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("vertex embedding failed")))
+    }
+}
+
+impl EmbedModel for VertexEmbed {
+    fn embed_batch(&mut self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+        let mut out = Vec::with_capacity(texts.len());
+        for batch in texts.chunks(4) {
+            out.extend(self.predict(batch, "RETRIEVAL_DOCUMENT")?);
+        }
+        Ok(out)
+    }
+
+    fn embed_queries(&mut self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+        self.predict(texts, "RETRIEVAL_QUERY")
+    }
+
+    fn embed_one(&mut self, text: &str) -> Result<Vec<f32>> {
+        self.predict(&[text], "RETRIEVAL_QUERY")?
+            .pop()
+            .ok_or_else(|| anyhow::anyhow!("vertex returned no embedding"))
+    }
+
+    fn token_count(&self, text: &str) -> usize {
+        text.len() / 4 + 1
+    }
+
+    fn dim(&self) -> usize {
+        self.dim
+    }
+}
+
+/// Build the configured embedder: local llama.cpp by default, Vertex AI when
+/// `ENGRAPH_EMBED_PROVIDER=vertex`.
+pub fn new_embedder(
+    models_dir: &Path,
+    config: &crate::config::Config,
+) -> Result<Box<dyn EmbedModel + Send>> {
+    if std::env::var("ENGRAPH_EMBED_PROVIDER").as_deref() == Ok("vertex") {
+        return Ok(Box::new(VertexEmbed::from_env()?));
+    }
+    Ok(Box::new(LlamaEmbed::new(models_dir, config)?))
+}
+
 // ── Heuristic orchestrator ───────────────────────────────────────────────────
 
 /// Heuristic orchestrator — no LLM, fast path when intelligence is off.
@@ -1447,6 +1599,61 @@ mod tests {
         let fmt = PromptFormat::detect("random-model.gguf");
         let formatted = fmt.format_document("Title", "Body");
         assert_eq!(formatted, "Title\nBody");
+    }
+
+    #[test]
+    fn test_vertex_embed_queries_single_request() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut req = Vec::new();
+            let mut chunk = [0u8; 4096];
+            loop {
+                let n = sock.read(&mut chunk).unwrap();
+                req.extend_from_slice(&chunk[..n]);
+                let text = String::from_utf8_lossy(&req).to_string();
+                if let Some(end) = text.find("\r\n\r\n") {
+                    let len: usize = text
+                        .lines()
+                        .find_map(|l| {
+                            l.to_lowercase()
+                                .strip_prefix("content-length:")
+                                .map(|v| v.trim().parse().unwrap())
+                        })
+                        .unwrap();
+                    if req.len() >= end + 4 + len {
+                        break;
+                    }
+                }
+            }
+            let req = String::from_utf8_lossy(&req).to_string();
+            let body = r#"{"predictions":[{"embeddings":{"values":[3.0,4.0]}},{"embeddings":{"values":[0.0,2.0]}}]}"#;
+            write!(
+                sock,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+            req
+        });
+
+        let mut e = VertexEmbed {
+            endpoint: format!("http://127.0.0.1:{port}/predict"),
+            dim: 2,
+            agent: ureq::Agent::new(),
+            token: Some(("tok".into(), std::time::Instant::now())),
+        };
+        let vecs = e.embed_queries(&["a b", "c"]).unwrap();
+        let req = server.join().unwrap();
+
+        assert!(req.contains("RETRIEVAL_QUERY"));
+        assert!(req.to_lowercase().contains("authorization: bearer tok"));
+        assert_eq!(vecs.len(), 2);
+        assert!((vecs[0][0] - 0.6).abs() < 1e-6 && (vecs[0][1] - 0.8).abs() < 1e-6);
+        assert!((vecs[1][1] - 1.0).abs() < 1e-6);
     }
 
     // ── heuristic_orchestrate tests ──────────────────────────────────────────
