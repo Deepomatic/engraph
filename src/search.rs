@@ -118,11 +118,17 @@ pub fn search_with_intelligence(
     let mut all_semantic: Vec<RankedResult> = Vec::new();
     let mut all_fts: Vec<RankedResult> = Vec::new();
 
-    for expanded_query in &orchestration.expansions {
+    let expansion_refs: Vec<&str> = orchestration
+        .expansions
+        .iter()
+        .map(|s| s.as_str())
+        .collect();
+    let query_vecs = embedder
+        .embed_queries(&expansion_refs)
+        .context("embedding query")?;
+
+    for (expanded_query, query_vec) in orchestration.expansions.iter().zip(query_vecs) {
         // Semantic lane
-        let query_vec = embedder
-            .embed_one(expanded_query)
-            .context("embedding query")?;
         let tombstones = std::collections::HashSet::new();
         let raw_results = config
             .store
